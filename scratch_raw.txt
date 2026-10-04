@@ -1,0 +1,458 @@
+﻿# src/discovery.py
+"""
+YouTube Micro-Influencer Discovery Module
+==========================================
+Discovers real Technology / AI YouTube channels using the YouTube Data API v3.
+
+Responsibilities:
+  - Read the API key from the YOUTUBE_API_KEY environment variable (.env).
+  - Run multiple AI/Tech keyword searches, paginating each query.
+  - Collect 100-200 unique channel IDs so downstream filtering has enough data.
+  - Deduplicate channel IDs before fetching details.
+  - Fetch real channel metadata and statistics via channels.list.
+  - Save all results to data/influencers_raw.csv WITHOUT any subscriber filtering.
+    Filtering is handled separately in filtering.py.
+  - Handle API errors gracefully so one failed request does not abort the run.
+
+CSV columns saved:
+  name, channel_id, platform, profile_url, subscribers, description
+
+Usage:
+  python src/discovery.py
+  # or import in app.py:
+  from src.discovery import run_discovery
+"""
+
+import os
+import time
+import logging
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# ---------------------------------------------------------------------------
+# Load environment variables from .env
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Where to write the raw discovered data
+OUTPUT_CSV = Path("data/influencers_raw.csv")
+
+# Stop the search phase once this many unique raw channel IDs have been gathered.
+# Set well above 50 so that filtering.py has plenty of candidates to work with.
+RAW_ID_TARGET = 200
+
+# YouTube Data API limits:
+#   search.list  -> max 50 results per page, costs 100 quota units per call
+#   channels.list -> max 50 IDs per request, costs ~1 quota unit per call
+MAX_RESULTS_PER_PAGE = 50
+CHANNELS_BATCH_SIZE = 50
+
+# Pause between consecutive API calls (seconds) to be a polite API consumer
+SEARCH_PAUSE = 0.5
+DETAILS_PAUSE = 0.3
+
+# Technology / AI keyword queries. Multiple queries produce variety and volume.
+SEARCH_QUERIES = [
+    "artificial intelligence tutorial",
+    "machine learning python",
+    "deep learning explained",
+    "large language models tutorial",
+    "generative AI tools",
+    "computer vision tutorial",
+    "natural language processing NLP",
+    "data science for beginners",
+    "AI news technology 2024",
+    "neural networks explained",
+    "AI engineering projects",
+    "AI productivity tools",
+    "robotics artificial intelligence",
+    "AI research explained",
+    "python AI projects",
+]
+
+# Logging â€” configured once here; callers that import this module
+# will inherit the root logger settings.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# YouTube API client
+# ---------------------------------------------------------------------------
+
+def build_youtube_client():
+    """
+    Build and return an authenticated YouTube Data API v3 client.
+
+    Reads the API key from the YOUTUBE_API_KEY environment variable,
+    which should be set in .env (loaded above by load_dotenv).
+
+    Returns:
+        googleapiclient Resource object for the YouTube v3 API.
+
+    Raises:
+        ValueError: If YOUTUBE_API_KEY is missing or empty.
+    """
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "YOUTUBE_API_KEY is not set. "
+            "Copy .env.example to .env and add your YouTube Data API v3 key."
+        )
+    log.info("YouTube API client built successfully.")
+    return build("youtube", "v3", developerKey=api_key)
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Search for channel IDs
+# ---------------------------------------------------------------------------
+
+def search_channels_for_query(youtube, query, max_pages=2):
+    """
+    Search YouTube for channels matching a keyword query and collect channel IDs.
+
+    Uses search.list with type='channel' so only channel results are returned.
+    When type='channel', the channel ID is found at item['id']['channelId'],
+    not inside the snippet.
+
+    Paginates up to max_pages pages to maximise the number of results per query.
+
+    Args:
+        youtube:   Authenticated YouTube API client.
+        query:     Keyword search string.
+        max_pages: Maximum number of result pages to fetch (default 2).
+                   Each page costs 100 quota units.
+
+    Returns:
+        List of channel ID strings collected for this query.
+        Returns an empty list if all pages fail.
+    """
+    collected_ids = []
+    next_page_token = None
+
+    for page_num in range(1, max_pages + 1):
+        try:
+            log.info("  Searching: '%s'  (page %d of %d)", query, page_num, max_pages)
+
+            # Build request params; only include pageToken when paginating
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "channel",
+                "maxResults": MAX_RESULTS_PER_PAGE,
+                "relevanceLanguage": "en",
+            }
+            if next_page_token:
+                params["pageToken"] = next_page_token
+
+            response = youtube.search().list(**params).execute()
+
+            for item in response.get("items", []):
+                # For type=channel searches, channelId is under item['id']['channelId']
+                channel_id = item.get("id", {}).get("channelId")
+                if channel_id:
+                    collected_ids.append(channel_id)
+
+            log.info("    -> %d IDs collected so far for this query", len(collected_ids))
+
+            # Move to the next page if one exists
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+
+            time.sleep(SEARCH_PAUSE)
+
+        except HttpError as exc:
+            log.error("  API error on '%s' page %d: %s", query, page_num, exc)
+            break
+        except Exception as exc:
+            log.error("  Unexpected error on '%s' page %d: %s", query, page_num, exc)
+            break
+
+    return collected_ids
+
+
+def collect_channel_ids(youtube):
+    """
+    Run all SEARCH_QUERIES and collect a deduplicated set of channel IDs.
+
+    Stops iterating queries once RAW_ID_TARGET unique IDs have been gathered,
+    which saves API quota while still providing plenty of data for filtering.py.
+
+    Args:
+        youtube: Authenticated YouTube API client.
+
+    Returns:
+        List of unique channel ID strings.
+    """
+    seen = set()
+
+    for query in SEARCH_QUERIES:
+        if len(seen) >= RAW_ID_TARGET:
+            log.info(
+                "Raw ID target (%d) reached â€” stopping search phase.", RAW_ID_TARGET
+            )
+            break
+
+        new_ids = search_channels_for_query(youtube, query)
+        before = len(seen)
+        seen.update(new_ids)
+        added = len(seen) - before
+
+        log.info(
+            "Query '%s' complete: +%d new unique IDs | total unique: %d",
+            query, added, len(seen),
+        )
+
+        time.sleep(SEARCH_PAUSE)
+
+    unique_ids = list(seen)
+    log.info("Search phase done. %d unique channel IDs collected.", len(unique_ids))
+    return unique_ids
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Fetch channel details and statistics
+# ---------------------------------------------------------------------------
+
+def fetch_channel_details(youtube, channel_ids):
+    """
+    Fetch metadata and statistics for a list of channel IDs using channels.list.
+
+    Sends requests in batches of CHANNELS_BATCH_SIZE (max 50, the API limit).
+    Returns the raw API response items so no information is discarded before
+    the filtering step.
+
+    Fields requested (part='snippet,statistics'):
+      snippet.title         -> channel display name
+      snippet.description   -> channel description
+      snippet.customUrl     -> vanity handle (e.g. @channelname)
+      statistics.subscriberCount
+      statistics.hiddenSubscriberCount
+
+    Args:
+        youtube:     Authenticated YouTube API client.
+        channel_ids: List of channel ID strings to look up.
+
+    Returns:
+        List of raw channel resource dicts from the API.
+    """
+    all_items = []
+    total = len(channel_ids)
+
+    for start in range(0, total, CHANNELS_BATCH_SIZE):
+        batch = channel_ids[start : start + CHANNELS_BATCH_SIZE]
+        ids_param = ",".join(batch)
+        batch_num = start // CHANNELS_BATCH_SIZE + 1
+        batch_end = start + len(batch)
+
+        try:
+            log.info(
+                "Fetching details: batch %d (channels %d-%d of %d)",
+                batch_num, start + 1, batch_end, total,
+            )
+            response = (
+                youtube.channels()
+                .list(
+                    part="snippet,statistics",
+                    id=ids_param,
+                    maxResults=CHANNELS_BATCH_SIZE,
+                )
+                .execute()
+            )
+            items = response.get("items", [])
+            all_items.extend(items)
+            log.info("  -> %d records returned in this batch", len(items))
+
+        except HttpError as exc:
+            log.error("  API error on details batch %d: %s", batch_num, exc)
+        except Exception as exc:
+            log.error("  Unexpected error on details batch %d: %s", batch_num, exc)
+
+        time.sleep(DETAILS_PAUSE)
+
+    log.info("Details phase done. %d channel records retrieved.", len(all_items))
+    return all_items
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Parse API response into flat records
+# ---------------------------------------------------------------------------
+
+def parse_channel_records(raw_channels):
+    """
+    Convert raw API channel resource dicts into flat, CSV-ready records.
+
+    NOTE: No subscriber-count filtering is applied here.
+          All channels with a readable subscriber count are included.
+          Channels where subscriberCount is hidden by the owner are skipped
+          because the data would be incomplete.
+
+    Builds the profile URL from the channel's custom handle when available,
+    otherwise falls back to the canonical /channel/<id> URL.
+
+    Args:
+        raw_channels: List of channel resource dicts from channels.list.
+
+    Returns:
+        List of flat dicts with keys:
+          name, channel_id, platform, profile_url, subscribers, description
+    """
+    records = []
+
+    for item in raw_channels:
+        snippet = item.get("snippet", {})
+        stats = item.get("statistics", {})
+        channel_name = snippet.get("title", "")
+
+        # Skip channels that hide their subscriber count â€” data would be incomplete
+        if stats.get("hiddenSubscriberCount", False):
+            log.debug("Skipping '%s': subscriber count is hidden.", channel_name)
+            continue
+
+        # Read and validate the subscriber count
+        raw_subs = stats.get("subscriberCount")
+        if raw_subs is None:
+            log.debug("Skipping '%s': no subscriberCount in API response.", channel_name)
+            continue
+
+        try:
+            subscribers = int(raw_subs)
+        except (ValueError, TypeError):
+            log.debug(
+                "Skipping '%s': subscriberCount '%s' could not be parsed as int.",
+                channel_name, raw_subs,
+            )
+            continue
+
+        # Build the public-facing channel URL
+        custom_url = snippet.get("customUrl", "")
+        if custom_url:
+            # customUrl is already in @handle format (e.g. "@channelname")
+            profile_url = "https://www.youtube.com/" + custom_url
+        else:
+            profile_url = "https://www.youtube.com/channel/" + item["id"]
+
+        records.append({
+            "name":        channel_name,
+            "channel_id":  item["id"],
+            "platform":    "YouTube",
+            "profile_url": profile_url,
+            "subscribers": subscribers,
+            "description": snippet.get("description", "").strip(),
+        })
+
+    log.info("Parsing done. %d channels with readable subscriber counts.", len(records))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Save to CSV
+# ---------------------------------------------------------------------------
+
+def save_to_csv(records, output_path):
+    """
+    Write channel records to a CSV file at output_path.
+
+    Creates the parent directory if it does not exist.
+    Columns are written in a fixed order for a stable schema.
+
+    Args:
+        records:     List of flat channel dicts to write.
+        output_path: pathlib.Path pointing to the destination CSV file.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    columns = ["name", "channel_id", "platform", "profile_url", "subscribers", "description"]
+    df = pd.DataFrame(records, columns=columns)
+    df.to_csv(output_path, index=False, encoding="utf-8")
+
+    log.info("Saved %d rows to %s", len(df), output_path)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def run_discovery():
+    """
+    Run the full YouTube channel discovery pipeline.
+
+    Pipeline steps:
+      1. Build an authenticated YouTube Data API v3 client.
+      2. Search multiple AI/Tech keyword queries (with pagination) to collect
+         at least RAW_ID_TARGET unique channel IDs.
+      3. Deduplicate channel IDs.
+      4. Fetch channel metadata and statistics via channels.list.
+      5. Parse API responses into flat records (no subscriber filtering).
+      6. Save all records to data/influencers_raw.csv.
+
+    Returns:
+        pandas DataFrame containing all discovered channels.
+
+    Raises:
+        ValueError:  If YOUTUBE_API_KEY is not configured.
+        RuntimeError: If no channel IDs are collected (network or key issue).
+    """
+    log.info("=" * 55)
+    log.info("  YouTube Channel Discovery â€” starting")
+    log.info("  Raw ID target: %d channels", RAW_ID_TARGET)
+    log.info("  Output: %s", OUTPUT_CSV)
+    log.info("=" * 55)
+
+    # Step 1: Build client
+    youtube = build_youtube_client()
+
+    # Step 2 & 3: Search and deduplicate channel IDs
+    channel_ids = collect_channel_ids(youtube)
+    if not channel_ids:
+        raise RuntimeError(
+            "No channel IDs were collected. "
+            "Check your YOUTUBE_API_KEY and internet connection."
+        )
+
+    # Step 4: Fetch full channel details for all collected IDs
+    raw_channels = fetch_channel_details(youtube, channel_ids)
+
+    # Step 5: Parse into flat records (no filtering here)
+    records = parse_channel_records(raw_channels)
+
+    if not records:
+        log.warning(
+            "No parseable channel records found. "
+            "All channels may have hidden subscriber counts."
+        )
+
+    # Step 6: Persist to CSV
+    save_to_csv(records, OUTPUT_CSV)
+
+    log.info("Discovery complete. %d raw channels saved.", len(records))
+    return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    result_df = run_discovery()
+    print("\nDiscovery complete.")
+    print("Rows saved:", len(result_df))
+    print("Output file:", OUTPUT_CSV)
+    if not result_df.empty:
+        pd.set_option("display.max_colwidth", 60)
+        print(result_df[["name", "subscribers", "profile_url"]].to_string(index=False))
+

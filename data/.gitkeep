@@ -1,0 +1,2 @@
+# Keeps the data/ directory tracked by git while ignoring generated files
+# (the .gitignore at the repo root already ignores *.csv, *.json, *.db)
