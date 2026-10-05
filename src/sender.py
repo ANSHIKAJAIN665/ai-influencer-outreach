@@ -69,7 +69,10 @@ def run_sender(input_path: Path = INPUT_CSV) -> dict[str, int]:
 
     for _, row in df.iterrows():
         email, channel_id = str(row.contact_email).strip(), str(row.channel_id).strip()
-        name, subject, message = str(row.name).strip(), str(row.email_subject).strip(), str(row.email_pitch).strip()
+        # `row.name` is Pandas' numeric row index; the creator name must come
+        # from the dataset field so both the tracker and SQLite audit are correct.
+        name = str(row["name"]).strip()
+        subject, message = str(row.email_subject).strip(), str(row.email_pitch).strip()
         if not _valid_email(email):
             result["skipped"] += 1
             continue
